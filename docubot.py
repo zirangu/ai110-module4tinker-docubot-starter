@@ -8,6 +8,7 @@ Core DocuBot class responsible for:
 """
 
 import os
+import re
 import glob
 
 class DocuBot:
@@ -64,8 +65,22 @@ class DocuBot:
         ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for filename, text in documents:
+            for token in self._tokenize(text):
+                filenames = index.setdefault(token, [])
+                if filename not in filenames:
+                    filenames.append(filename)
         return index
+
+    # -----------------------------------------------------------
+    # Tokenization helper
+    # -----------------------------------------------------------
+
+    def _tokenize(self, text):
+        """
+        Lowercase and split text into word tokens, stripping punctuation.
+        """
+        return re.findall(r"[a-z0-9]+", text.lower())
 
     # -----------------------------------------------------------
     # Scoring and Retrieval (Phase 1)
@@ -73,45 +88,109 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
-
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        Count total occurrences of each query word in the document text.
+        Words that appear multiple times contribute multiple points,
+        which rewards documents that discuss the query terms more heavily.
         """
-        # TODO: implement scoring
-        return 0
+        query_words = [w for w in self._tokenize(query) if w not in self.STOPWORDS]
+        if not query_words:
+            return 0
+
+        doc_words = self._tokenize(text)
+        score = 0
+        for word in query_words:
+            score += doc_words.count(word)
+        return score
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
-
-        Return a list of (filename, text) sorted by score descending.
+        Use the inverted index to find candidate documents (those containing
+        at least one query word), score each with score_document, then
+        return the top_k (filename, text) pairs sorted by score descending.
+        Documents that score 0 are excluded.
         """
-        results = []
-        # TODO: implement retrieval logic
+        query_words = [w for w in self._tokenize(query) if w not in self.STOPWORDS]
+
+        candidate_filenames = set()
+        for word in query_words:
+            candidate_filenames.update(self.index.get(word, []))
+
+        scored = []
+        for filename, text in self.documents:
+            if filename not in candidate_filenames:
+                continue
+            score = self.score_document(query, text)
+            if score > 0:
+                scored.append((score, filename, text))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+
+        results = [(filename, text) for _, filename, text in scored]
         return results[:top_k]
 
     # -----------------------------------------------------------
     # Answering Modes
     # -----------------------------------------------------------
 
+    MIN_SCORE_THRESHOLD = 2
+    SNIPPET_RADIUS = 300  # characters shown on each side of the best match
+
+    STOPWORDS = {
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "of",
+        "to", "in", "on", "for", "and", "or", "what", "how", "does", "do",
+        "it", "this", "that", "with", "as", "at", "by", "from",
+    }
+
+    def _extract_snippet(self, query, text):
+        """
+        Return a short window of text centered on the first query word
+        found in the document, instead of the full document body.
+        """
+        query_words = self._tokenize(query)
+        lower_text = text.lower()
+
+        best_pos = -1
+        for word in query_words:
+            pos = lower_text.find(word)
+            if pos != -1 and (best_pos == -1 or pos < best_pos):
+                best_pos = pos
+
+        if best_pos == -1:
+            best_pos = 0
+
+        start = max(0, best_pos - self.SNIPPET_RADIUS)
+        end = min(len(text), best_pos + self.SNIPPET_RADIUS)
+        snippet = text[start:end].strip()
+
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(text):
+            snippet = snippet + "..."
+
+        return snippet
+
     def answer_retrieval_only(self, query, top_k=3):
         """
         Phase 1 retrieval only mode.
-        Returns raw snippets and filenames with no LLM involved.
+        Returns short snippets (not full documents) with no LLM involved.
+
+        Guardrail: if the best match's score is below MIN_SCORE_THRESHOLD,
+        treat it as too weak a match and refuse rather than returning
+        low-confidence results.
         """
         snippets = self.retrieve(query, top_k=top_k)
 
         if not snippets:
             return "I do not know based on these docs."
 
+        best_score = self.score_document(query, snippets[0][1])
+        if best_score < self.MIN_SCORE_THRESHOLD:
+            return "I do not know based on these docs."
+
         formatted = []
         for filename, text in snippets:
-            formatted.append(f"[{filename}]\n{text}\n")
+            snippet = self._extract_snippet(query, text)
+            formatted.append(f"[{filename}]\n{snippet}\n")
 
         return "\n---\n".join(formatted)
 
